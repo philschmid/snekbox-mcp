@@ -1,0 +1,28 @@
+# Use the official snekbox image as a base
+FROM ghcr.io/python-discord/snekbox:latest
+
+# Install fastmcp and its dependencies
+RUN python -m pip install "fastmcp"
+
+# Copy the modified config to overwrite the original
+COPY config/snekbox.mcp.cfg /snekbox/config/snekbox.cfg
+
+# Copy the application source
+COPY . /snekbox_src
+
+# Hotfix: Rename logging module to avoid conflict
+RUN mv /snekbox_src/snekbox/logging /snekbox_src/snekbox/sneklog \
+    && sed -i 's/from snekbox.logging/from snekbox.sneklog/g' /snekbox_src/snekbox/__init__.py \
+    && cat /snekbox_src/snekbox/__init__.py
+
+# Install google-genai into the snekbox environment
+RUN export PYTHONUSERBASE=/snekbox/user_base \
+    && /snekbin/python/default/bin/python -m pip install --user "google-genai"
+
+# Set the entrypoint to run the mcp server
+ENTRYPOINT ["python", "/snekbox_src/snekbox/mcp_server.py"]
+CMD []
+
+# To run this container with proper DNS and network access, use:
+# podman run --rm -it --dns=8.8.8.8 -p 8000:8000 --name snekbox-mcp --privileged <image_name>
+# podman run --rm -it --dns=8.8.8.8 -p 8000:8000 --name snekbox-mcp --privileged snekbox-mcp
