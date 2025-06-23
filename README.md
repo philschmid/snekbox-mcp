@@ -1,151 +1,154 @@
-[![Discord][5]][6]
-[![Build Status][1]][2]
-[![Coverage Status][3]][4]
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+# Snekbox MCP Server
 
-# snekbox
+> [!NOTE]
+> This is a fork of the original [Python Discord Snekbox](https://github.com/python-discord/snekbox) project with added Model Context Protocol (MCP) support. For the original HTTP REST API functionality and complete documentation, please refer to the [official repository](https://github.com/python-discord/snekbox).
 
-Python sandbox runners for executing code in isolation aka snekbox.
+A Model Context Protocol server that provides secure Python code execution in a sandboxed environment. This server enables LLMs to execute Python code safely using [NsJail] sandboxing technology, the same battle-tested security approach used by Python Discord.
 
-Supports a memory [read/write file system](#memory-file-system) within the sandbox, allowing text or binary files to be sent and returned.
+**Available Tools:**
+- **execute** - Executes Python code in a sandboxed environment
+  - `code` (string, required): The Python code to execute
 
-A client sends Python code to a snekbox, the snekbox executes the code, and finally the results of the execution are returned to the client.
+## Security & Sandboxing
+
+Snekbox uses [NsJail] to provide robust sandboxing for Python code execution. This multi-layered security approach includes:
+
+### NsJail Security Features
+- **Time limits**: Code execution is limited to 6 seconds to prevent infinite loops
+- **Memory limits**: Restricted to ~70MB RAM with no swap to prevent memory exhaustion  
+- **Process limits**: Maximum of 6 processes to prevent fork bombs
+- **Network isolation**: No network access by default (configurable for MCP)
+- **Filesystem isolation**: Read-only system filesystem with isolated tmpfs working directory
+- **User namespace isolation**: Code runs as unprivileged user (uid/gid 65534)
+- **Resource limits**: CPU, memory, and file system quotas prevent resource abuse
+
+### MCP Configuration Changes
+
+The MCP version includes modified security settings in `snekbox.mcp.cfg`:
+
+```diff
+- clone_newnet: true    # Original: Complete network isolation
++ clone_newnet: false   # MCP: Allows network access for AI model calls
+
++ # Additional DNS resolution support
++ mount {
++     src: "/etc/resolv.conf"
++     dst: "/etc/resolv.conf"
++     is_bind: true
++     rw: false
++ }
++ 
++ mount {
++     src: "/etc/hosts"
++     dst: "/etc/hosts"
++     is_bind: true
++     rw: false
++ }
+```
+
+**Why This Is Still Secure:**
+- Network access is granted but all other isolation layers remain intact
+- Code still runs in isolated user/process/filesystem namespaces
+- Resource limits prevent DoS attacks
+- No persistent storage or system access
+- Execution time and memory limits prevent runaway processes
+
+## How It Works
 
 ```mermaid
 %%{init: { 'sequence': {'mirrorActors': false, 'messageFontWeight': 300, 'actorFontFamily': '-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif' } } }%%
 sequenceDiagram
 
-actor Client
+actor LLM as LLM Client
+participant MCP as MCP Server
 participant Snekbox
 participant NsJail
 participant Python as Python Subprocess
 
-Client ->>+ Snekbox: HTTP POST
+LLM ->>+ MCP: execute(code="print('hello')")
+MCP ->>+ Snekbox: Python code
 Snekbox ->>+ NsJail: Python code
-NsJail ->>+ Python: Python code
+NsJail ->>+ Python: Python code (sandboxed)
 Python -->>- NsJail: Execution result
 NsJail -->>- Snekbox: Execution result
-Snekbox -->>- Client: JSON response
+Snekbox -->>- MCP: stdout/stderr
+MCP -->>- LLM: Formatted response
 ```
 
-The code is executed in a Python process that is launched through [NsJail], which is responsible for sandboxing the Python process.
+The MCP server receives Python code from LLM clients and executes it through the same secure NsJail sandbox used by the original snekbox, with the addition of network access to support AI model interactions.
 
-The output returned by snekbox is truncated at around 1 MB by default, but this can be [configured](#gunicorn).
+## Installation
 
-## HTTP REST API
+```bash
+git clone https://github.com/philschmid/snekbox-mcp.git
 
-Communication with snekbox is done over a HTTP REST API. The framework for the HTTP REST API is [Falcon] and the WSGI being used is [Gunicorn]. By default, the server is hosted on `0.0.0.0:8060` with two workers.
+# Build the MCP image
+docker build -f Dockerfile.mcp -t snekbox-mcp .
 
-See [`snekapi.py`] and [`resources`] for API documentation.
-
-## Running snekbox
-
-A Docker image is available in the [GitHub Container Registry]. A container can be started with the following command, which will also pull the image if it doesn't currently exist locally:
-
-```
-docker run --ipc=none --privileged -p 8060:8060 ghcr.io/python-discord/snekbox
+# Run with network access for AI model calls 
+docker run --rm -it --dns=8.8.8.8 -p 8000:8000 --name snekbox-mcp --privileged snekbox-mcp 
 ```
 
-To run it in the background, use the `-d` option. See the documentation on [`docker run`] for more information.
+The server will start on `http://0.0.0.0:8000/mcp/`
 
-The above command will make the API accessible on the host via `http://localhost:8060/`. Currently, there's only one endpoint: `http://localhost:8060/eval`.
+## Usage Examples
 
-### Python multi-version support
+Add to your `mcpServers` configuration:
 
-By default, the executable that runs within nsjail is defined by `DEFAULT_EXECUTABLE_PATH` at the top of [`nsjail.py`]. This can be overridden by specifying `executable_path` in the request body of calls to `POST /eval` or by setting the `executable_path` kwarg if calling `NSJail.python3()` directly.
 
-Any executable that exists within the container is a valid value for `executable_path`. The main use case of this feature is currently to specify the version of Python to use.
+**HTTP Mode:**
+```json
+{
+  "mcpServers": {
+    "snekbox": {
+      "url": "http://localhost:8000/mcp/"
+    }
+  }
+}
+```
 
-Python versions currently available can be found in the [`Dockerfile`] by looking for build stages that match `builder-py-*`. These binaries are then copied into the `base` build stage further down.
+### With MCP Inspector
 
-## Configuration
+Start the server and test it using the MCP inspector:
 
-Configuration files can be edited directly. However, this requires rebuilding the image. Alternatively, a Docker volume or bind mounts can be used to override the configuration files at their default locations.
-
-### NsJail
-
-The main features of the default configuration are:
-
-* Time limit
-* Memory limit
-* Process count limit
-* No networking
-* Restricted, read-only system filesystem
-* Memory-based read-write filesystem mounted as working directory `/home`
-
-NsJail is configured through [`snekbox.cfg`]. It contains the exact values for the items listed above. The configuration format is defined by a [protobuf file][7] which can be referred to for documentation. The command-line options of NsJail can also serve as documentation since they closely follow the config file format.
-
-### Memory File System
-
-On each execution, the host will mount an instance-specific `tmpfs` drive, this is used as a limited read-write folder for the sandboxed code. There is no access to other files or directories on the host container beyond the other read-only mounted system folders. Instance file systems are isolated; it is not possible for sandboxed code to access another instance's writeable directory.
-
-The following options for the memory file system are configurable as options in [gunicorn.conf.py](config/gunicorn.conf.py)
-
-* `memfs_instance_size` Size in bytes for the capacity of each instance file system.
-* `memfs_home` Path to the home directory within the instance file system.
-* `memfs_output` Path to the output directory within the instance file system.
-* `files_limit` Maximum number of valid output files to parse.
-* `files_timeout` Maximum time in seconds for output file parsing and encoding.
-* `files_pattern` Glob pattern to match files within `output`.
-
-The sandboxed code execution will start with a writeable working directory of `home`. By default, the output folder is also `home`. New files, and uploaded files with a newer last modified time, will be uploaded on completion.
-
-### Gunicorn
-
-[Gunicorn settings] can be found in [`gunicorn.conf.py`]. In the default configuration, the worker count, the bind address, and the WSGI app URI are likely the only things of any interest. Since it uses the default synchronous workers, the [worker count] effectively determines how many concurrent code evaluations can be performed.
-
-`wsgi_app` can be given arguments which are forwarded to the [`NsJail`] object. For example, `wsgi_app = "snekbox:SnekAPI(max_output_size=2_000_000, read_chunk_size=20_000)"`.
-
-### Environment Variables
-
-All environment variables have defaults and are therefore not required to be set.
-
-Name | Description
----- | -----------
-`SNEKBOX_DEBUG` | Enable debug logging if set to a non-empty value.
-`SNEKBOX_SENTRY_DSN` | [Data Source Name] for Sentry. Sentry is disabled if left unset.
+```bash
+# In another terminal, start the inspector
+npx @modelcontextprotocol/inspector
+```
 
 ## Third-party Packages
 
-By default, the Python interpreter has no access to any packages besides the  standard library. Even snekbox's own dependencies like Falcon and Gunicorn are not exposed.
+By default, the Python interpreter has access to the standard library plus any packages installed in the container. The MCP version includes `google-genai` pre-installed for AI model interactions.
 
-To expose third-party Python packages during evaluation, install them to a custom user site:
+To add additional packages to a running container:
 
-```sh
-docker exec snekbox /bin/sh -c \
-    'PYTHONUSERBASE=/snekbox/user_base /snekbin/python/default/bin/python -m pip install --user numpy'
+```bash
+docker exec snekbox-mcp /bin/sh -c \
+    'PYTHONUSERBASE=/snekbox/user_base /snekbin/python/default/bin/python -m pip install --user numpy pandas'
 ```
 
-In the above command, `snekbox` is the name of the running container. The name may be different and can be checked with `docker ps`.
+## Configuration
 
-The packages will be installed to the user site within `/snekbox/user_base`. To persist the installed packages, a volume for the directory can be created with Docker. For an example, see [`docker-compose.yml`].
+The MCP server uses a modified NsJail configuration (`snekbox.mcp.cfg`) that enables network access while maintaining all other security restrictions. Key differences from the original:
 
-## Development Environment
+- **Network Access**: `clone_newnet: false` allows outbound connections
+- **DNS Resolution**: Mounts `/etc/resolv.conf` and `/etc/hosts` for name resolution
+- **Same Security**: All other isolation and resource limits remain unchanged
 
-See [CONTRIBUTING.md](.github/CONTRIBUTING.md).
+For more detailed configuration options, see the [original snekbox documentation](https://github.com/python-discord/snekbox#configuration).
 
+## Development
 
-[1]: https://github.com/python-discord/snekbox/workflows/main/badge.svg?branch=main
-[2]: https://github.com/python-discord/snekbox/actions/workflows/main.yaml?query=event%3Apush+branch%3Amain
-[3]: https://coveralls.io/repos/github/python-discord/snekbox/badge.svg?branch=main
-[4]: https://coveralls.io/github/python-discord/snekbox?branch=main
-[5]: https://raw.githubusercontent.com/python-discord/branding/main/logos/badge/badge_github.svg
-[6]: https://discord.gg/python
-[7]: https://github.com/google/nsjail/blob/master/config.proto
-[`gunicorn.conf.py`]: config/gunicorn.conf.py
-[`snekbox.cfg`]: config/snekbox.cfg
-[`nsjail.py`]: snekbox/nsjail.py
-[`snekapi.py`]: snekbox/api/snekapi.py
-[`resources`]: snekbox/api/resources
-[`docker-compose.yml`]: docker-compose.yml
-[`Dockerfile`]: Dockerfile
-[`docker run`]: https://docs.docker.com/engine/reference/commandline/run/
-[nsjail]: https://github.com/google/nsjail
-[falcon]: https://falconframework.org/
-[gunicorn]: https://gunicorn.org/
-[gunicorn settings]: https://docs.gunicorn.org/en/latest/settings.html
-[worker count]: https://docs.gunicorn.org/en/latest/design.html#how-many-workers
-[sentry release]: https://docs.sentry.io/platforms/python/configuration/releases/
-[data source name]: https://docs.sentry.io/product/sentry-basics/dsn-explainer/
-[GitHub Container Registry]: https://github.com/orgs/python-discord/packages/container/package/snekbox
-[`NsJail`]: snekbox/nsjail.py
+Based on the original Python Discord snekbox project. See the [original repository](https://github.com/python-discord/snekbox) for development guidelines and contributing information.
+
+## License
+
+This project is licensed under the MIT License, same as the original snekbox project.
+
+## Credits
+
+- Original [Snekbox](https://github.com/python-discord/snekbox) by Python Discord
+- [NsJail](https://github.com/google/nsjail) by Google for sandboxing technology
+- [FastMCP](https://github.com/pydantic/fastmcp) for MCP server implementation
+
+[NsJail]: https://github.com/google/nsjail
